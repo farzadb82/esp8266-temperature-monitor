@@ -1,69 +1,96 @@
---    Test communication of DHT sensor
---    Tested with Lua NodeMCU 0.9.5 build 20150127 floating point !!!
--- 1. Flash Lua NodeMCU to ESP module.
--- 2. Set in program wots.lua humidity sensor type. This is parameter typeSensor="dht11" or "dht22".
--- 3. Load program wots.lua and testdht.lua to ESP8266 with LuaLoader
--- 4. HW reset module
--- 5. Run program wots.lua - dofile(wots.lua)
+-- Read temperature from DHT11/DHT22 temperature+humidity sensor
 
-sensorType="dht11"
-sensorPin=4 --  data pin, GPIO0=3 GPIO2=4
+-- luacheck: ignore node
+-- luacheck: ignore adc
+-- luacheck: ignore tmr
+-- luacheck: ignore _
 
-apiHost = "data.sparkfun.com"
-apiPublicKey = ""
-apiPrivateKey = ""
-REFRESH_TIME = 60000
+local moduleName = "temp_monitor"
+local M = {}
+_G[moduleName] = M
 
-function sendData(temp, humidity)
-    -- Establish connection
-    phant = require("phant")
-    phant.init(apiHost, apiPublicKey, apiPrivateKey)
-    phant.add("humidity", humidity)
-    phant.add("temp", temp)
+local _config = require("config")
 
-    print("Sending data to "..apiHost)
+local _REFRESH_TIME = 60000000 -- in us
 
-    conn = net.createConnection(net.TCP, 0) 
+function M.send_data(temp, humidity, battery)
+    local aio = require("aio")
+    aio.init(_config.AIO_KEY)
 
-    conn:on("receive", function(conn, payload)
-                print("Received Response.")
-                --print(payload)
+    go_sleep = function(code, _)
+        if (code < 200) then
+            print("Failure code:" .. code)
+        end
+        if (code > 0) then
+            print("Sent all data")
+        else
+            print("Failed to send data")
+        end
+
+        print("Going to sleep ...")
+        node.dsleep(_REFRESH_TIME)
+    end
+
+    send_battery = function(code, _)
+        if (code < 200) then
+            print("Failure code:" .. code)
+        end
+        if (code > 0) then
+            -- A short delay is needed between successive calls to http
+            tmr.alarm(0, 100, tmr.ALARM_SINGLE, function()
+                print("Sending battery voltage")
+                aio.sendValue(battery, _config.AIO_FEED_BATTERY, go_sleep)
             end)
-    conn:on("sent", function(conn)
-                print("Sent.")
-                --conn:close()
+        end
+    end
+
+    send_humidity = function(code, _)
+        if (code < 200) then
+            print("Failure code:" .. code)
+        end
+        if (code > 0) then
+            -- A short delay is needed between successive calls to http
+            tmr.alarm(0, 100, tmr.ALARM_SINGLE, function()
+                print("Sending temperature")
+                aio.sendValue(temp, _config.AIO_FEED_TEMP, send_battery)
             end)
-    conn:on("disconnection", function(conn)
-                print("Got disconnection.")
-                node.dsleep(60000000)
-            end)
-    conn:on("connection", function(conn, payload)
-                --print("\nSending:\n"..phant.post())
-                conn:send(phant.post())
-            end)
-    conn:connect(80, apiHost)
+        end
+    end
+
+    print("Sending humidity")
+    aio.sendValue(humidity, _config.AIO_FEED_HUMIDITY, send_humidity)
 end
 
 --load DHT module for read sensor
-function ReadDHT()
-    dht=require(sensorType)
-    dht.read(sensorPin)
+function M.read_dht()
+    -- luacheck: ignore dht
 
-    h=dht.getHumidity()
-    t=dht.getTemperature()
+    local _status, _t, _h, _b
+    _status, _t, _h, _, _ = dht.read(_config.SENSOR_PIN)
+    _b = adc.readvdd33(0)
 
-    print("\nHumidity:    "..h.."%")
-    print("Temperature: "..t.." deg C")
+    if _status == dht.OK then
+        print("\nHumidity:    " .. _h .. "%")
+        print("Temperature: " .. _t .. " deg C")
+        print("Battery: " .. _b .. "mV")
 
-    sendData(t, h)
+        M.send_data(_t, _h, _b)
+        return
+    elseif _status == dht.ERROR_CHECKSUM then
+        print("DHT Checksum error.")
+    elseif _status == dht.ERROR_TIMEOUT then
+        print("DHT timed out.")
+    end
 
-    -- release module
-    dht=nil
-    package.loaded[sensorType]=nil
+    -- If we get here (we shouldn't unless something broke!), reset everything
+    tmr.alarm(0, 1000, tmr.ALARM_SINGLE, function()
+        print("Resetting NodeMCU")
+        node.restart()
+    end)
 end
 
 -- Every REFRESH_TIME get the new measurement and upload it
---tmr.alarm(0, 100, tmr.ALARM_SINGLE, ReadDHT)
---print("\nStarted Monitoring Temperature and Humidity every "..REFRESH_TIME.."ms ...")
---tmr.alarm(0, REFRESH_TIME, tmr.ALARM_AUTO, ReadDHT)
-ReadDHT()
+-- tmr.alarm(0, 100, tmr.ALARM_SINGLE, ReadDHT)
+-- print("\nStarted Monitoring Temperature and Humidity every "..REFRESH_TIME.."ms ...")
+-- tmr.alarm(0, REFRESH_TIME, tmr.ALARM_AUTO, ReadDHT)
+M.read_dht()
